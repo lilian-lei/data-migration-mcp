@@ -28,10 +28,11 @@ import csv          # CSV file parsing (reading headers and row data)
 import io           # (unused but available for in-memory stream handling)
 import logging      # Structured logging for debugging and audit trails
 import os           # Access environment variables for secrets and config
+import json         # Read/write profiles.json for runtime context switching
 import re           # Regex for email/UUID/sentinel value validation
 from datetime import datetime  # Date format parsing in validation checks
 from pathlib import Path          # Cross-platform filesystem path operations
-from typing import Annotated, Any, Literal  # Type-hint helpers
+from typing import Annotated, Any, Literal, Optional  # Type-hint helpers
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -54,38 +55,81 @@ from mcp.server.fastmcp import FastMCP  # FastMCP framework for building MCP too
 from pydantic import Field               # Field metadata for tool parameter descriptions
 
 # ---------------------------------------------------------------------------
-# Configuration — pull from env so credentials never live in code
+# Configuration — loaded from src/profiles.json with env-var overrides.
 # ---------------------------------------------------------------------------
+# Resolution order for each setting (first non-empty wins):
+#   1. The matching env var in .mcp.json (highest precedence — back-compat)
+#   2. The active environment block in profiles.json
+#   3. A built-in default (only for graphql_url + workspace_root)
+#
+# Callers can mutate the active context at runtime via `switch_context` —
+# which rebinds these module-level globals AND rewrites profiles.json's
+# "current" block, so the change survives MCP-server restarts.
 
-# The SymLiv GraphQL API endpoint. Defaults to production; override via env
-# var to point at staging or a local dev server.
-SYMLIV_GRAPHQL_URL = os.environ.get(
-    "SYMLIV_GRAPHQL_URL", "https://api.symliv.com/graphql"
+PROFILES_PATH = Path(__file__).parent / "profiles.json"
+
+def _load_profiles() -> dict[str, Any]:
+    """Read profiles.json. Returns empty-shape if missing or invalid so the
+    server still boots from env vars alone."""
+    if not PROFILES_PATH.exists():
+        return {"environments": {}, "current": {}}
+    try:
+        return json.loads(PROFILES_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {"environments": {}, "current": {}}
+
+def _save_profiles(profiles: dict[str, Any]) -> None:
+    """Persist profiles back to disk (called by switch_context)."""
+    PROFILES_PATH.write_text(json.dumps(profiles, indent=2) + "\n")
+
+def _active_env_block(profiles: dict[str, Any]) -> dict[str, str]:
+    """Return the env-block (graphql_url, mongo_uri, jwt_secret, ...) for the
+    currently-selected environment, or an empty dict if none is configured."""
+    env_name = (profiles.get("current") or {}).get("environment") or ""
+    return (profiles.get("environments") or {}).get(env_name) or {}
+
+_PROFILES = _load_profiles()
+_ENV_BLOCK = _active_env_block(_PROFILES)
+
+# Each global is "env var wins, then profile, then built-in default."
+SYMLIV_ENV_NAME = (_PROFILES.get("current") or {}).get("environment") or ""
+
+SYMLIV_GRAPHQL_URL = (
+    os.environ.get("SYMLIV_GRAPHQL_URL")
+    or _ENV_BLOCK.get("graphql_url")
+    or "https://api.symliv.com/graphql"
 )
-
-# Admin bearer token (symlivAdmin role). Required for all import mutations.
-# Must be set in the environment — the server will refuse to run imports without it.
-# NOTE: declared as a module-level mutable so the `remint_admin_token` tool can
-# replace it at runtime (its `global` statement rebinds this name).
-SYMLIV_ADMIN_TOKEN = os.environ.get("SYMLIV_ADMIN_TOKEN", "")
-
-# HS256 secret used to sign new admin JWTs in the `remint_admin_token` tool.
-# Must match the backend's JWT_SECRET_KEY for the minted token to verify.
-# Optional: only required if you intend to call `remint_admin_token`.
-SYMLIV_JWT_SECRET_KEY = os.environ.get("SYMLIV_JWT_SECRET_KEY", "")
-
-# The UUID of the community being migrated. Sent as the X-Community-Id header
-# so the API knows which community's data to modify.
-SYMLIV_COMMUNITY_ID = os.environ.get("SYMLIV_COMMUNITY_ID", "")
-
-# Filesystem root for community workspaces — one subdirectory per community
-# holding everything we know about it: archived CSVs from every import
-# attempt, computed diffs (repairs), onboarding workbooks, and a single
-# append-only timeline.jsonl of every event. See `_community_dir()` for
-# the on-disk layout.
-SYMLIV_WORKSPACE_ROOT = os.environ.get(
-    "SYMLIV_WORKSPACE_ROOT",
-    str(Path.home() / "Documents" / "symliv-data" / "communities"),
+SYMLIV_ADMIN_TOKEN = (
+    os.environ.get("SYMLIV_ADMIN_TOKEN")
+    or _ENV_BLOCK.get("admin_token")
+    or ""
+)
+SYMLIV_JWT_SECRET_KEY = (
+    os.environ.get("SYMLIV_JWT_SECRET_KEY")
+    or _ENV_BLOCK.get("jwt_secret")
+    or ""
+)
+SYMLIV_COMMUNITY_ID = (
+    os.environ.get("SYMLIV_COMMUNITY_ID")
+    or (_PROFILES.get("current") or {}).get("community_id")
+    or ""
+)
+SYMLIV_WORKSPACE_ROOT = (
+    os.environ.get("SYMLIV_WORKSPACE_ROOT")
+    or _ENV_BLOCK.get("workspace_root")
+    or str(Path.home() / "Documents" / "symliv-data" / "communities")
+)
+# Mongo connection settings (consumed later in this module when the pymongo
+# client is created). Promoted to globals so switch_context can swap them.
+SYMLIV_MONGO_URI = (
+    os.environ.get("SYMLIV_MONGO_URI")
+    or _ENV_BLOCK.get("mongo_uri")
+    or ""
+)
+SYMLIV_MONGO_DB = (
+    os.environ.get("SYMLIV_MONGO_DB")
+    or _ENV_BLOCK.get("mongo_db")
+    or "main"
 )
 
 # Maps a human-friendly "import type" key (used by MCP tool callers) to the
@@ -134,6 +178,12 @@ _APPLICATION_STATUS = {
 }
 _PASS_STATUS = {"incomplete", "inactive", "active", "expired", "suspended"}
 _PAYMENT_STATUS = {"unpaid", "paid", "refunded", "partially-refunded"}
+# Valid values for the passes.passType / pass.passType column. The backend
+# rejects anything else with "must be one of the following values: …".
+# Observed values that look plausible but FAIL: "cart" (golf carts must
+# use passType=resident with a Long-Term-Lease-Barcode passInfoId instead).
+_PASS_TYPE = {"guest", "single", "vendor", "invited-guest",
+              "fast-pass", "wristband", "resident", "visitor"}
 # Note: rental unit statuses are CAPITALIZED in the docs unlike the others
 _RENTAL_UNIT_STATUS = {"Active", "Pending Review", "Rejected", "Expired", "Refunded"}
 
@@ -205,6 +255,9 @@ IMPORT_SCHEMAS: dict[str, dict[str, Any]] = {
             "pass.endDate": "date",
             "pass.status": "string",
             "pass.paid": "string",
+            "pass.passType": "string",
+            "pass.facilityCode": "int",
+            "pass.externalCredentialNumber": "string",
             "vehicle.destinationAddressId": "uuid",
             "vehicle.year": "int",
             "fcException": "bool",
@@ -213,6 +266,7 @@ IMPORT_SCHEMAS: dict[str, dict[str, Any]] = {
         "enums": {
             "pass.status": _PASS_STATUS,
             "pass.paid": _PAYMENT_STATUS,
+            "pass.passType": _PASS_TYPE,
         },
     },
     "resident_users": {
@@ -255,7 +309,10 @@ IMPORT_SCHEMAS: dict[str, dict[str, Any]] = {
             "passes.endDate": "date",
             "passes.status": "string",
             "passes.paid": "string",
+            "passes.passType": "string",
             "passes.shared": "bool",
+            "passes.facilityCode": "int",
+            "passes.externalCredentialNumber": "string",
             "vehicle.destinationAddressId": "uuid",
             "vehicle.year": "int",
             "fcException": "bool",
@@ -264,6 +321,7 @@ IMPORT_SCHEMAS: dict[str, dict[str, Any]] = {
         "enums": {
             "passes.status": _PASS_STATUS,
             "passes.paid": _PAYMENT_STATUS,
+            "passes.passType": _PASS_TYPE,
         },
     },
     "host_users": {
@@ -319,6 +377,9 @@ IMPORT_SCHEMAS: dict[str, dict[str, Any]] = {
             "pass.endDate": "date",
             "pass.status": "string",
             "pass.paid": "string",
+            "pass.passType": "string",
+            "pass.facilityCode": "int",
+            "pass.externalCredentialNumber": "string",
             "vehicle.year": "int",
             "rental.numberGuests": "int",
             "rental.numberPets": "int",
@@ -329,6 +390,7 @@ IMPORT_SCHEMAS: dict[str, dict[str, Any]] = {
         "enums": {
             "pass.status": _PASS_STATUS,
             "pass.paid": _PAYMENT_STATUS,
+            "pass.passType": _PASS_TYPE,
         },
     },
     "guest_users": {
@@ -818,6 +880,73 @@ async def get_pass_infos(
     return infos
 
 
+# ---- Discovery Tool: resolve_pass_info_id ----
+# Look up a specific PassInfo UUID by its human-readable name. Pass-import
+# CSVs often contain placeholder UUIDs that need to be replaced with the
+# real value for the current community/environment — this tool wraps the
+# lookup so callers can resolve "Resident RFID" or "Long Term Lease Barcode"
+# without needing to know the UUID up front (and without needing to update
+# CSVs when switching from staging to prod, where the UUIDs differ).
+@mcp.tool()
+async def resolve_pass_info_id(
+    name: Annotated[
+        str,
+        Field(description="The human-readable PassInfo name from the pass "
+                          "builder (e.g. 'Resident RFID', 'Long Term Lease "
+                          "Barcode'). Matched case-insensitively."),
+    ],
+    portal: Annotated[
+        Literal["resident", "vendor", "host", "guest", "visitor", "any"],
+        Field(description="Restrict to a portal to disambiguate names that "
+                          "appear in multiple portals."),
+    ] = "any",
+) -> dict[str, Any]:
+    """Resolve a PassInfo UUID by name within the current community.
+
+    Returns {"passInfoId": uuid, "portal": "resident", "name": "..."} on
+    exact (case-insensitive) match. If no exact match, returns
+    {"ok": False, "candidates": [...]} so the caller can disambiguate.
+    """
+    all_infos = await get_pass_infos(portal="any")
+    needle = name.strip().lower()
+    matches = [
+        p for p in all_infos
+        if (p.get("name") or "").strip().lower() == needle
+        and (portal == "any" or p.get("portal") == portal)
+    ]
+    if len(matches) == 1:
+        m = matches[0]
+        return {
+            "ok": True,
+            "passInfoId": m.get("passInfoId"),
+            "portal": m.get("portal"),
+            "name": m.get("name"),
+            "community_id": SYMLIV_COMMUNITY_ID,
+        }
+    if len(matches) > 1:
+        return {
+            "ok": False,
+            "error": (f"Multiple PassInfos named {name!r} found "
+                      f"(across portals). Filter by portal to disambiguate."),
+            "candidates": matches,
+        }
+    # No exact match — return all candidates from the active portal filter
+    # so the caller can see what's available and pick / fix the name.
+    candidates = all_infos if portal == "any" else [
+        p for p in all_infos if p.get("portal") == portal
+    ]
+    return {
+        "ok": False,
+        "error": f"No PassInfo named {name!r} in community {SYMLIV_COMMUNITY_ID!r}",
+        "candidates": [
+            {"passInfoId": c.get("passInfoId"),
+             "name": c.get("name"),
+             "portal": c.get("portal")}
+            for c in candidates
+        ],
+    }
+
+
 # ---- Discovery Tool: get_community_addresses ----
 # Fetches all addresses already loaded into the community. Two main uses:
 #   1. Post-import verification — confirm addresses imported correctly
@@ -949,6 +1078,14 @@ def _validate_rows(
     issues: list[dict[str, Any]] = []
     rows_with_errors = 0
     total_issues = 0
+    # Column-level blank tracking: numeric-typed columns whose cells are
+    # blank cast to NaN at commit time (we hit this with vehicle.year and
+    # passes.facilityCode). Track blank counts per typed column so we can
+    # warn the caller to either drop the column or default the values.
+    NUMERIC_DTYPES = {"int", "positive_int", "number"}
+    blank_counts: dict[str, int] = {
+        col: 0 for col, dt in types.items() if dt in NUMERIC_DTYPES
+    }
 
     def add(row_n: int, field: str, code: str, value: Any) -> None:
         nonlocal total_issues
@@ -980,6 +1117,9 @@ def _validate_rows(
         # Datatype checks (skipped if empty — emptiness handled above)
         for col, dtype in types.items():
             v = _get_path(row, col)
+            # Track blank cells in numeric columns (will NaN-cast at commit)
+            if dtype in NUMERIC_DTYPES and _is_empty(v) and col in row:
+                blank_counts[col] += 1
             code = _check_value(v, dtype)
             if code:
                 add(i, col, code, v); row_errs += 1
@@ -994,11 +1134,22 @@ def _validate_rows(
         if row_errs:
             rows_with_errors += 1
 
+    # Numeric columns with any blanks → commit-time NaN error. Emit as a
+    # warning (not a hard error) since technically every row is well-formed.
+    numeric_blank_warnings = [
+        {"field": col, "blank_rows": n,
+         "fix": f"Drop the {col} column from the CSV, or fill blanks with a default."}
+        for col, n in blank_counts.items() if n > 0
+    ]
+
     return {
         "row_count": len(rows),
         "rows_with_errors": rows_with_errors,
         "total_issues": total_issues,
         "issues_sample": issues,
+        "warnings": {
+            "numeric_columns_with_blanks": numeric_blank_warnings,
+        },
     }
 
 
@@ -1118,6 +1269,18 @@ def validate_csv(
     # Row-level deep validation
     result = _validate_rows(import_type, rows, sample_size)
 
+    warnings = result.get("warnings", {}) or {}
+    blank_warns = warnings.get("numeric_columns_with_blanks") or []
+    next_step = (
+        "Fix the cells listed in issues_sample, then re-validate."
+        if result["total_issues"] > 0
+        else (
+            "WARNING: numeric columns have blank cells — commit will fail with "
+            "NaN cast errors. See warnings.numeric_columns_with_blanks."
+            if blank_warns
+            else "Call dry_run_import to validate against the SymLiv API."
+        )
+    )
     return {
         "ok": result["total_issues"] == 0,
         "import_type": import_type,
@@ -1126,11 +1289,8 @@ def validate_csv(
         "rows_with_errors": result["rows_with_errors"],
         "total_issues": result["total_issues"],
         "issues_sample": result["issues_sample"],
-        "next_step": (
-            "Call dry_run_import to validate against the SymLiv API."
-            if result["total_issues"] == 0
-            else "Fix the cells listed in issues_sample, then re-validate."
-        ),
+        "warnings": warnings,
+        "next_step": next_step,
     }
 
 
@@ -1198,44 +1358,56 @@ def identify_import_type(
 # Tools — execution
 # ---------------------------------------------------------------------------
 
-async def _run_import(
-    import_type: str,
-    csv_path: str,
+# Max rows per single GraphQL mutation, keyed by import_type. Large payloads
+# routinely exceed the App Runner / proxy response timeout (~60s): the server
+# keeps processing in the background and rows DO land, but the HTTP request
+# returns empty / drops mid-flight, leaving the caller uncertain about state.
+# Chunking keeps each call short enough to get a clean response back.
+#
+# Pass imports are slowest per row (the server creates pass + vehicle +
+# registration documents each) — keep these small at 200. User and
+# property/link imports are faster per row but a 1,800-row resident_users
+# import still times out, so chunk those at 500.
+CHUNK_SIZES: dict[str, int] = {
+    "host_users":          500,
+    "resident_users":      500,
+    "host_rental_units":   500,
+    "resident_properties": 500,
+    "vendor_users":        500,
+    "guest_users":         500,
+    "resident_passes":     200,
+    "vendor_passes":       200,
+    "host_guest_passes":   200,
+}
+
+
+def _split_csv_into_chunks(csv_path: str, chunk_size: int) -> list[bytes]:
+    """Split a CSV file into N chunks of ≤ chunk_size rows each (preserving
+    the header on every chunk). Returns a list of UTF-8-encoded CSV bytes."""
+    raw = Path(csv_path).read_text()
+    lines = raw.splitlines(keepends=True)
+    if not lines:
+        return []
+    header = lines[0]
+    data_lines = lines[1:]
+    chunks = []
+    for i in range(0, len(data_lines), chunk_size):
+        body = header + "".join(data_lines[i:i + chunk_size])
+        chunks.append(body.encode("utf-8"))
+    return chunks
+
+
+async def _submit_one_batch(
+    mutation_name: str,
+    csv_bytes: bytes,
+    filename: str,
     no_mutation: bool,
 ) -> dict[str, Any]:
-    """Core import execution shared by dry_run_import and commit_import.
-
-    Args:
-        import_type: Key from IMPORT_MUTATIONS (e.g. "resident_users").
-        csv_path:    Absolute filesystem path to the CSV file.
-        no_mutation: If True, the API validates but does NOT write any records
-                     (dry-run mode). If False, records are actually created.
-
-    Returns a dict with "ok" (bool), import metadata, and a "summary" containing
-    successCount, errorCount, and per-row error details from the API.
+    """Submit a single CSV payload to the SymLiv import endpoint and return
+    the raw GraphQL response. Caller is responsible for parsing/aggregating.
     """
-    mode = "DRY RUN" if no_mutation else "COMMIT"
-    logger.info("_run_import [%s]: type=%s path=%s", mode, import_type, csv_path)
-
-    # Basic input validation — same checks as validate_csv
-    if import_type not in IMPORT_MUTATIONS:
-        return {"ok": False, "error": f"Unknown import_type '{import_type}'"}
-    if not Path(csv_path).exists():
-        return {"ok": False, "error": f"File not found: {csv_path}"}
-
-    # Look up the GraphQL mutation name and read the CSV content
-    mutation_name = IMPORT_MUTATIONS[import_type]
-    # Per schema introspection against staging admin-back, every parse*CsvFile
-    # mutation accepts (filePath: String!, originalFileName: String!,
-    # noMutation: Boolean), where `filePath` is misleadingly named but is
-    # actually the **base64-encoded CSV bytes** (mirrors test-import.sh's
-    # `FILE_B64=$(base64 -i $CSV_FILE)`). Return type is
-    # StringResponse { success, data, error } — `data` is a JSON string
-    # holding the row-by-row success/error counts.
     import base64
-    csv_b64 = base64.b64encode(Path(csv_path).read_bytes()).decode("ascii")
-    original_filename = Path(csv_path).name
-
+    csv_b64 = base64.b64encode(csv_bytes).decode("ascii")
     mutation = f"""
         mutation Run($filePath: String!, $originalFileName: String!,
                      $noMutation: Boolean) {{
@@ -1246,13 +1418,214 @@ async def _run_import(
           ) {{ success error data }}
         }}
     """
-
-    # Execute the mutation against the SymLiv GraphQL API
-    data = await _graphql(mutation, {
+    return await _graphql(mutation, {
         "filePath": csv_b64,
-        "originalFileName": original_filename,
+        "originalFileName": filename,
         "noMutation": no_mutation,
     })
+
+
+# Tokens in the per-row `logs` column that indicate the row actually
+# succeeded. Used by _parse_per_row_results to disambiguate real failures
+# from "Could not match address ---"-style warnings (which appear in the
+# `errors` column even on successful upserts).
+_SUCCESS_LOG_TOKENS = (
+    "data validation passed",
+    "successfully",
+    "skipping mutation",
+)
+
+def _parse_per_row_results(
+    data_str: str | None,
+    sample_size: int = 5,
+) -> dict[str, Any]:
+    """Parse the per-row CSV result that SymLiv import mutations return.
+
+    The mutation's `data` field is a CSV with the original headers plus
+    two appended columns: `logs` and `errors`. A row is considered OK if
+    the `logs` column contains a success token ("Data validation passed",
+    "successfully", or "Skipping mutation" for dry-runs). The `errors`
+    column on a successful row may still contain warnings (e.g. "Could
+    not match address ---") — those are NOT counted as failures.
+
+    Returns:
+        {
+          "row_count":     int   # total rows after header
+          "ok_count":      int   # rows with success token in logs
+          "err_count":     int   # rows with no success token
+          "warning_count": int   # rows that succeeded but had non-empty errors
+          "sample_errors": list  # up to `sample_size` failing rows (verbatim)
+          "format":        "csv" | "json" | "raw"
+        }
+    """
+    out = {"row_count": 0, "ok_count": 0, "err_count": 0,
+           "warning_count": 0, "sample_errors": [], "format": "raw"}
+    if not data_str or not isinstance(data_str, str):
+        return out
+
+    s = data_str.strip()
+    # Some endpoints (or future versions) may return a JSON summary instead.
+    if s.startswith(("{", "[")):
+        try:
+            parsed = _json.loads(s)
+            out["format"] = "json"
+            if isinstance(parsed, dict):
+                out["ok_count"] = int(parsed.get("successCount") or 0)
+                out["err_count"] = int(parsed.get("errorCount") or 0)
+                out["row_count"] = out["ok_count"] + out["err_count"]
+                errs = parsed.get("errors") or []
+                if isinstance(errs, list):
+                    out["sample_errors"] = errs[:sample_size]
+            return out
+        except _json.JSONDecodeError:
+            pass  # fall through to CSV parsing
+
+    # CSV path
+    import csv as _csv
+    lines = s.split("\n")
+    if len(lines) <= 1:
+        return out
+    out["format"] = "csv"
+    try:
+        header = next(_csv.reader([lines[0]]))
+    except Exception:
+        return out
+    try:
+        logs_idx = header.index("logs")
+    except ValueError:
+        logs_idx = -1
+    try:
+        err_idx = header.index("errors")
+    except ValueError:
+        err_idx = -1
+
+    for ln in lines[1:]:
+        if not ln.strip():
+            continue
+        out["row_count"] += 1
+        try:
+            cols = next(_csv.reader([ln]))
+        except Exception:
+            out["err_count"] += 1
+            if len(out["sample_errors"]) < sample_size:
+                out["sample_errors"].append(ln[:300])
+            continue
+        logs = (cols[logs_idx] if 0 <= logs_idx < len(cols) else "").lower()
+        errs = (cols[err_idx]  if 0 <= err_idx  < len(cols) else "").strip()
+        succeeded = any(tok in logs for tok in _SUCCESS_LOG_TOKENS)
+        if succeeded:
+            out["ok_count"] += 1
+            if errs:
+                out["warning_count"] += 1
+        else:
+            out["err_count"] += 1
+            if len(out["sample_errors"]) < sample_size:
+                out["sample_errors"].append(ln[:300])
+    return out
+
+
+async def _run_import(
+    import_type: str,
+    csv_path: str,
+    no_mutation: bool,
+) -> dict[str, Any]:
+    """Core import execution shared by dry_run_import and commit_import.
+
+    Pass imports (resident_passes, vendor_passes, host_guest_passes) are
+    chunked at CHUNK_SIZES[import_type] rows per call to avoid the upstream
+    HTTP timeout that silently truncates response bodies on big payloads
+    (see project memory: symliv-pass-import-timeout). All other types run
+    single-shot.
+
+    Args:
+        import_type: Key from IMPORT_MUTATIONS (e.g. "resident_users").
+        csv_path:    Absolute filesystem path to the CSV file.
+        no_mutation: If True, the API validates but does NOT write any records
+                     (dry-run mode). If False, records are actually created.
+
+    Returns a dict with "ok" (bool), import metadata, and a "summary" containing
+    successCount, errorCount, and per-row error details from the API. When
+    chunked, "summary.chunks" lists each batch's result and the top-level
+    successCount/errorCount are aggregated.
+    """
+    mode = "DRY RUN" if no_mutation else "COMMIT"
+    logger.info("_run_import [%s]: type=%s path=%s", mode, import_type, csv_path)
+
+    # Basic input validation — same checks as validate_csv
+    if import_type not in IMPORT_MUTATIONS:
+        return {"ok": False, "error": f"Unknown import_type '{import_type}'"}
+    if not Path(csv_path).exists():
+        return {"ok": False, "error": f"File not found: {csv_path}"}
+
+    mutation_name = IMPORT_MUTATIONS[import_type]
+    original_filename = Path(csv_path).name
+    chunk_size = CHUNK_SIZES.get(import_type, 0)
+
+    # --- chunked path (pass imports) -----------------------------------
+    if chunk_size > 0:
+        chunks = _split_csv_into_chunks(csv_path, chunk_size)
+        logger.info("_run_import [%s] chunking %s into %d batches of ≤%d rows",
+                    mode, import_type, len(chunks), chunk_size)
+        chunk_results: list[dict[str, Any]] = []
+        total_success = 0
+        total_errors = 0
+        any_graphql_error = False
+        for i, batch in enumerate(chunks, start=1):
+            batch_name = f"{Path(original_filename).stem}.batch{i:03d}.csv"
+            logger.info("  batch %d/%d (%d rows)", i, len(chunks),
+                        batch.count(b"\n") - 1)
+            data = await _submit_one_batch(
+                mutation_name, batch, batch_name, no_mutation,
+            )
+            if "errors" in data:
+                any_graphql_error = True
+                chunk_results.append({"batch": i, "graphql_errors": data["errors"]})
+                continue
+            payload = data.get("data", {}).get(mutation_name, {}) or {}
+            raw = payload.get("data")
+            parsed = _parse_per_row_results(raw)
+            total_success += parsed["ok_count"]
+            total_errors  += parsed["err_count"]
+            chunk_results.append({
+                "batch": i, "rows": batch.count(b"\n") - 1,
+                "server_success": bool(payload.get("success")),
+                "server_error": payload.get("error"),
+                "ok_count": parsed["ok_count"],
+                "err_count": parsed["err_count"],
+                "warning_count": parsed["warning_count"],
+                "sample_errors": parsed["sample_errors"],
+            })
+
+        aggregate_ok = (not any_graphql_error
+                        and all(c.get("server_success") for c in chunk_results)
+                        and total_errors == 0)
+        result = {
+            "ok": aggregate_ok,
+            "dry_run": no_mutation,
+            "import_type": import_type,
+            "mutation": mutation_name,
+            "chunked": True,
+            "chunk_size": chunk_size,
+            "chunk_count": len(chunks),
+            "summary": {
+                "successCount": total_success,
+                "errorCount": total_errors,
+                "chunks": chunk_results,
+            },
+        }
+        archived = _archive_import(
+            import_type, csv_path,
+            "dry_run" if no_mutation else "commit", result,
+        )
+        if archived:
+            result["archive"] = archived
+        return result
+
+    # --- single-call path (everything else) ----------------------------
+    csv_bytes = Path(csv_path).read_bytes()
+    data = await _submit_one_batch(
+        mutation_name, csv_bytes, original_filename, no_mutation,
+    )
 
     # Check for top-level GraphQL errors (auth failures, schema errors, etc.)
     if "errors" in data:
@@ -1269,45 +1642,39 @@ async def _run_import(
         return result
 
     # Extract the mutation result payload. StringResponse returns
-    # { success: bool, data: string?, error: string? }. The `data` field
-    # is typically a JSON string with per-row success/error counts; we try
-    # to parse it but pass it through as-is on failure so the operator can
-    # still see whatever the server said.
+    # { success: bool, data: string?, error: string? }. The `data` field is
+    # a per-row CSV with appended `logs`/`errors` columns (sometimes a JSON
+    # summary instead). _parse_per_row_results handles both shapes — check
+    # `logs` for success tokens first, then count remaining as real errors.
     payload = data.get("data", {}).get(mutation_name, {}) or {}
     server_success = bool(payload.get("success"))
     server_error = payload.get("error")
     raw_data = payload.get("data")
-    parsed_data: Any = raw_data
-    if isinstance(raw_data, str) and raw_data.strip().startswith(("{", "[")):
-        try:
-            parsed_data = _json.loads(raw_data)
-        except _json.JSONDecodeError:
-            parsed_data = raw_data
-    # Treat the import as `ok` when:
-    #   - server `success` is true, AND
-    #   - if parsed_data exposes an `errorCount`/`errors`, that count is 0
-    ok = server_success
-    if isinstance(parsed_data, dict):
-        ec = parsed_data.get("errorCount")
-        if isinstance(ec, int) and ec > 0:
-            ok = False
-        if parsed_data.get("errors"):
-            # Treat a non-empty errors list as a failure even if errorCount
-            # wasn't surfaced.
-            ok = False
-    logger.info("_run_import [%s] result: server_success=%s ok=%s",
-                mode, server_success, ok)
+    parsed = _parse_per_row_results(raw_data)
+    # Import is `ok` only if server reported success AND zero per-row errors.
+    ok = server_success and parsed["err_count"] == 0
+    logger.info(
+        "_run_import [%s] result: server_success=%s ok=%s rows=%d ok_rows=%d "
+        "err_rows=%d warn_rows=%d",
+        mode, server_success, ok, parsed["row_count"],
+        parsed["ok_count"], parsed["err_count"], parsed["warning_count"],
+    )
     if not ok:
-        logger.warning("Import not ok. server error=%s data=%s",
-                       server_error, parsed_data)
+        logger.warning("Import not ok. server_error=%s sample_errors=%s",
+                       server_error, parsed["sample_errors"][:3])
     result = {
         "ok": ok,
         "dry_run": no_mutation,
         "import_type": import_type,
         "mutation": mutation_name,
-        # Keep `summary` as the structured payload (parsed JSON when possible),
-        # plus the raw server fields for debugging.
-        "summary": parsed_data,
+        "summary": {
+            "row_count":     parsed["row_count"],
+            "successCount":  parsed["ok_count"],
+            "errorCount":    parsed["err_count"],
+            "warningCount":  parsed["warning_count"],
+            "sample_errors": parsed["sample_errors"],
+            "format":        parsed["format"],
+        },
         "server_success": server_success,
         "server_error": server_error,
     }
@@ -1451,11 +1818,21 @@ async def run_pipeline(
 
 from pymongo import MongoClient  # MongoDB driver for direct DB queries
 
-# Connect to MongoDB using credentials from environment variables.
-# IMPORTANT: these should be read-only credentials to prevent accidental writes.
-MONGO_URI = os.environ["SYMLIV_MONGO_URI"]
-_mongo = MongoClient(MONGO_URI)
-_db = _mongo[os.environ["SYMLIV_MONGO_DB"]]  # Select the target database (e.g. "main")
+# Connect to MongoDB. The URI + db come from the resolved config globals
+# (env var → profiles.json → default). switch_context rebinds these at
+# runtime, so we expose a helper to swap the client too.
+def _connect_mongo(uri: str, db_name: str):
+    """Create a MongoClient/db pair for the given URI/db. Used at init and
+    re-used by switch_context when the active environment changes."""
+    client = MongoClient(uri)
+    return client, client[db_name]
+
+if not SYMLIV_MONGO_URI:
+    raise RuntimeError(
+        "SYMLIV_MONGO_URI is not set in env, profiles.json, or built-in "
+        "default. The MCP server cannot reach the database."
+    )
+_mongo, _db = _connect_mongo(SYMLIV_MONGO_URI, SYMLIV_MONGO_DB)
 
 
 def _coll(name: str):
@@ -1525,6 +1902,194 @@ def find_orphan_addresses() -> list[dict[str, Any]]:
         {"$project": {"_id": 0, "address": 1, "communityAddressId": 1}},
     ]
     return list(_coll("community_addresses").aggregate(pipeline))
+
+
+# ---- MongoDB Tool: diff_against_db ----
+# Compute net-new rows for a CSV vs the currently-active community in Mongo.
+# Mirrors the ad-hoc diff scripts written for Champions Gate and Watersound
+# pre-import: returns net-new / already-present / FK-unresolvable counts so
+# you can know what an import would actually add (or skip) before committing.
+
+def _norm_addr_for_diff(x: Any) -> str:
+    """Normalize an address for set-comparison: lowercase, collapse spaces,
+    strip punctuation, expand common abbreviations. Mirrors the canonicalizer
+    used by build_clean_import.py so diffs are consistent."""
+    if x is None: return ""
+    a = str(x).strip().lower()
+    if not a: return ""
+    a = re.sub(r"\s+", " ", a)
+    a = re.sub(r"[\.,]", "", a)
+    a = re.sub(r"\s+#\s*", " # ", a)
+    for pat, val in {r"\bdr\b":"drive", r"\brd\b":"road", r"\bln\b":"lane",
+                     r"\bct\b":"court", r"\bpl\b":"place", r"\bave\b":"avenue",
+                     r"\bblvd\b":"boulevard", r"\bst\b":"street",
+                     r"\btrl\b":"trail", r"\bcir\b":"circle"}.items():
+        a = re.sub(pat, val, a)
+    return re.sub(r"\s+", " ", a).strip()
+
+
+@mcp.tool()
+def diff_against_db(
+    import_type: Annotated[
+        str,
+        Field(description="One of: community_addresses, resident_users, "
+                          "host_users, vendor_users, guest_users, "
+                          "resident_properties, host_rental_units, "
+                          "resident_passes, vendor_passes, host_guest_passes"),
+    ],
+    csv_path: Annotated[str, Field(description="Absolute path to a .csv or .xlsx file.")],
+    sample_size: Annotated[
+        int,
+        Field(description="Cap on the sample lists returned per category."),
+    ] = 15,
+) -> dict[str, Any]:
+    """Compare a CSV against the active community's Mongo to compute net-new
+    counts before importing. No writes — read-only.
+
+    Returns per-category counts:
+      - in_file:        unique keys in the CSV
+      - in_db:          keys already present in Mongo
+      - both:           overlap
+      - net_new_to_db:  keys in CSV not in Mongo (what an import would ADD)
+      - in_db_only:     keys in Mongo missing from CSV (potentially orphaned)
+      - fk_unresolvable (link tables only): rows whose foreign-key references
+        don't exist in Mongo and would fail at commit
+      - sample_net_new / sample_orphans: capped previews
+
+    The "natural key" used depends on import_type:
+      - *_users:           normalized email
+      - community_addresses: normalized address
+      - resident_properties/host_rental_units: (email, normalized address)
+      - resident_passes/vendor_passes: externalCredentialNumber
+    """
+    if import_type not in IMPORT_MUTATIONS:
+        return {"ok": False, "error": f"Unknown import_type {import_type!r}"}
+    if not Path(csv_path).exists():
+        return {"ok": False, "error": f"File not found: {csv_path}"}
+    try:
+        rows = _read_rows(csv_path)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+
+    def ne(v: Any) -> str:  # normalize email
+        return str(v).strip().lower() if v else ""
+
+    # Build a uid → email index once if we'll need it (link tables, passes)
+    def build_indexes() -> tuple[dict[str, str], dict[str, str]]:
+        uid_to_email = {
+            u["userId"]: ne(u.get("email", ""))
+            for u in _coll("users").find({}, {"email": 1, "userId": 1, "_id": 0})
+            if u.get("email")
+        }
+        caid_to_addr = {
+            a["communityAddressId"]: a.get("address", "")
+            for a in _coll("community_addresses").find(
+                {}, {"communityAddressId": 1, "address": 1, "_id": 0}
+            )
+        }
+        return uid_to_email, caid_to_addr
+
+    # ---- by import_type ----------------------------------------------
+    if import_type == "community_addresses":
+        file_keys = {_norm_addr_for_diff(r.get("address")) for r in rows
+                     if r.get("address")}
+        db_keys = {_norm_addr_for_diff(a.get("address"))
+                   for a in _coll("community_addresses").find(
+                       {}, {"address": 1, "_id": 0}) if a.get("address")}
+        return _diff_summary(import_type, "address", file_keys, db_keys, sample_size)
+
+    if import_type in ("resident_users", "host_users", "vendor_users", "guest_users"):
+        file_keys = {ne(r.get("user.email")) for r in rows
+                     if r.get("user.email")}
+        # Use role-specific membership if we can
+        if import_type == "resident_users":
+            uids = {p["userId"] for p in _coll("resident_profiles").find(
+                {}, {"userId": 1, "_id": 0})}
+            uid_to_email, _ = build_indexes()
+            db_keys = {uid_to_email.get(u) for u in uids if uid_to_email.get(u)}
+        elif import_type == "host_users":
+            uids = {h["userId"] for h in _coll("host_infos").find(
+                {}, {"userId": 1, "_id": 0})}
+            uid_to_email, _ = build_indexes()
+            db_keys = {uid_to_email.get(u) for u in uids if uid_to_email.get(u)}
+        elif import_type == "vendor_users":
+            db_keys = {ne(v.get("companyName", "")) for v in
+                       _coll("company_infos").find({}, {"companyName": 1, "_id": 0})
+                       if v.get("companyName")}
+            file_keys = {ne(r.get("company.companyName"))
+                         for r in rows if r.get("company.companyName")}
+        else:  # guest_users
+            uids = {g["userId"] for g in _coll("guest_infos").find(
+                {}, {"userId": 1, "_id": 0})}
+            uid_to_email, _ = build_indexes()
+            db_keys = {uid_to_email.get(u) for u in uids if uid_to_email.get(u)}
+        return _diff_summary(import_type,
+                             "company" if import_type == "vendor_users" else "email",
+                             file_keys, db_keys, sample_size)
+
+    if import_type in ("resident_properties", "host_rental_units"):
+        coll, fk_col = (
+            ("resident_properties", "user.address")
+            if import_type == "resident_properties"
+            else ("rental_units", "rentalUnit.address")
+        )
+        uid_to_email, caid_to_addr = build_indexes()
+        db_keys = set()
+        for d in _coll(coll).find({}, {"userId": 1, "communityAddressId": 1, "_id": 0}):
+            em = uid_to_email.get(d.get("userId"))
+            a = caid_to_addr.get(d.get("communityAddressId"))
+            if em and a:
+                db_keys.add((em, _norm_addr_for_diff(a)))
+        file_pairs = [(ne(r.get("user.email")), _norm_addr_for_diff(r.get(fk_col)))
+                      for r in rows if r.get("user.email") and r.get(fk_col)]
+        file_keys = set(file_pairs)
+        # FK check: addresses on the CSV must exist in community_addresses
+        norm_addrs = {_norm_addr_for_diff(a) for a in caid_to_addr.values()}
+        fk_unresolvable = sum(1 for _, a in file_pairs if a and a not in norm_addrs)
+        out = _diff_summary(import_type, "(email,address)", file_keys, db_keys, sample_size)
+        out["fk_unresolvable_addresses"] = fk_unresolvable
+        return out
+
+    if import_type in ("resident_passes", "vendor_passes", "host_guest_passes"):
+        # Pass external credential number — that's the natural dedupe key
+        ecn_field = ("passes.externalCredentialNumber"
+                     if import_type == "resident_passes"
+                     else "pass.externalCredentialNumber")
+        file_keys = {str(r.get(ecn_field, "")).strip()
+                     for r in rows if r.get(ecn_field)}
+        file_keys.discard("")
+        db_keys = {str(p["externalCredentialNumber"]).strip()
+                   for p in _coll("passes").find(
+                       {"externalCredentialNumber": {"$exists": True, "$nin": [None, ""]}},
+                       {"externalCredentialNumber": 1, "_id": 0})}
+        return _diff_summary(import_type, "externalCredentialNumber",
+                             file_keys, db_keys, sample_size)
+
+    return {"ok": False, "error": f"Diff not implemented for import_type {import_type!r}"}
+
+
+def _diff_summary(
+    import_type: str, key_field: str,
+    file_keys: set, db_keys: set, sample_size: int,
+) -> dict[str, Any]:
+    """Produce the standard diff response shape."""
+    net_new = file_keys - db_keys
+    orphans = db_keys - file_keys
+    return {
+        "ok": True,
+        "community_id": SYMLIV_COMMUNITY_ID,
+        "import_type": import_type,
+        "key_field": key_field,
+        "counts": {
+            "in_file": len(file_keys),
+            "in_db": len(db_keys),
+            "both": len(file_keys & db_keys),
+            "net_new_to_db": len(net_new),
+            "in_db_only": len(orphans),
+        },
+        "sample_net_new": list(net_new)[:sample_size],
+        "sample_orphans": list(orphans)[:sample_size],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1709,10 +2274,28 @@ def _verify_relational_pass(
 
 
 def _verify_resident_properties(rows: list[dict[str, Any]], sample_size: int) -> dict[str, Any]:
-    """Resident properties: file links user.email → user.address. Server stores
-    the address as resident_properties.street linked by userId. We confirm a
-    resident_property exists for that user with a matching street."""
+    """Resident properties: file links user.email → user.address. Two distinct
+    on-server linkage patterns exist:
+      (a) pre-import / legacy records denormalize the address as
+          `street` (and `_street`) on the resident_property document
+      (b) records inserted via parseResidentAddressCsvFile have NO `street`;
+          they link to community_addresses solely via `communityAddressId`
+    The verifier matches either pattern by resolving the raw user.address
+    string to a communityAddressId once up front, and then accepting a
+    resident_property as present if any of {street, _street, communityAddressId}
+    points to that address."""
     user_idx = _build_user_email_index()
+    # Build raw-address → communityAddressId index for the (b) pattern.
+    # Uses _norm_lookup so the lookup key is trimmed (but case-preserved, since
+    # addresses are stored mixed-case on the server).
+    addr_to_caid: dict[str, str] = {}
+    for a in _coll("community_addresses").find(
+        {}, {"_id": 0, "address": 1, "communityAddressId": 1}
+    ):
+        if a.get("address") and a.get("communityAddressId"):
+            key = _norm_lookup(a["address"], "address")
+            if isinstance(key, str) and key:
+                addr_to_caid[key] = a["communityAddressId"]
     props = _coll("resident_properties")
     matched = 0
     missing: list[dict[str, Any]] = []
@@ -1731,16 +2314,25 @@ def _verify_resident_properties(rows: list[dict[str, Any]], sample_size: int) ->
             if len(missing) < sample_size:
                 missing.append({"row": i, "reason": f"no user with email {email}"})
             continue
-        # Match either the canonical street or the raw _street, type-aware
-        candidates = props.find({"userId": uid}, {"street": 1, "_street": 1, "_id": 0})
-        if any(_values_equal(addr, c.get("street")) or _values_equal(addr, c.get("_street"))
-               for c in candidates):
+        addr_key = _norm_lookup(addr, "address")
+        target_caid = addr_to_caid.get(addr_key) if isinstance(addr_key, str) else None
+        candidates = list(props.find(
+            {"userId": uid},
+            {"street": 1, "_street": 1, "communityAddressId": 1, "_id": 0},
+        ))
+        if any(
+            _values_equal(addr, c.get("street"))
+            or _values_equal(addr, c.get("_street"))
+            or (target_caid and c.get("communityAddressId") == target_caid)
+            for c in candidates
+        ):
             matched += 1
         else:
             missing_count += 1
             if len(missing) < sample_size:
-                missing.append({"row": i, "reason": "no resident_property with matching street",
-                                 "email": email, "address": addr})
+                missing.append({"row": i, "reason": "no resident_property matched by street or communityAddressId",
+                                 "email": email, "address": addr,
+                                 "target_caid": target_caid})
     return {"matched": matched, "missing_count": missing_count, "mismatched_count": 0,
             "missing_sample": missing, "mismatched_sample": []}
 
@@ -2076,6 +2668,241 @@ def remint_admin_token(
             if update_in_process
             else "Token NOT applied to this process; paste it into "
                  "SYMLIV_ADMIN_TOKEN in your .mcp.json and restart."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tools — context switching (community + environment)
+# ---------------------------------------------------------------------------
+# These tools let you swap the active community and/or environment WITHOUT
+# editing .mcp.json or restarting Claude Code. They mutate the module-level
+# config globals, swap the Mongo client, re-mint the admin JWT for the new
+# context, and persist the selection back to profiles.json so it survives
+# subsequent MCP-server restarts.
+
+@mcp.tool()
+def current_context() -> dict[str, Any]:
+    """Inspect the active community + environment in this MCP process.
+    Read-only — mirrors the runtime state after any switch_context calls."""
+    return {
+        "environment": SYMLIV_ENV_NAME,
+        "community_id": SYMLIV_COMMUNITY_ID,
+        "graphql_url": SYMLIV_GRAPHQL_URL,
+        "mongo_db": SYMLIV_MONGO_DB,
+        "workspace_root": SYMLIV_WORKSPACE_ROOT,
+        "available_environments": sorted(
+            (_PROFILES.get("environments") or {}).keys()
+        ),
+    }
+
+
+@mcp.tool()
+def switch_context(
+    community_id: Annotated[
+        str,
+        Field(description="Target community (e.g. 'championsgate', 'solara')."),
+    ],
+    environment: Annotated[
+        Optional[str],
+        Field(
+            description="Target environment from profiles.json "
+                        "('staging', 'production', ...). Omit to keep the "
+                        "current environment."
+        ),
+    ] = None,
+    remint_token: Annotated[
+        bool,
+        Field(
+            description="If True (default), also mint a fresh symlivAdmin JWT "
+                        "for the new context. Set False if you've already "
+                        "supplied SYMLIV_ADMIN_TOKEN by other means."
+        ),
+    ] = True,
+) -> dict[str, Any]:
+    """Swap the active community (and optionally environment) in-process.
+
+    Updates module-level globals, swaps the MongoDB client to the new env's
+    URI, mints a fresh admin JWT for the target community, and persists the
+    new selection to src/profiles.json. No server restart needed — the very
+    next tool call uses the new context.
+    """
+    global SYMLIV_COMMUNITY_ID, SYMLIV_ENV_NAME
+    global SYMLIV_GRAPHQL_URL, SYMLIV_JWT_SECRET_KEY, SYMLIV_WORKSPACE_ROOT
+    global SYMLIV_MONGO_URI, SYMLIV_MONGO_DB
+    global SYMLIV_ADMIN_TOKEN
+    global _mongo, _db, _PROFILES, _ENV_BLOCK
+
+    # Reload profiles from disk so any out-of-band edits are picked up.
+    _PROFILES = _load_profiles()
+
+    target_env = environment or SYMLIV_ENV_NAME
+    envs = _PROFILES.get("environments") or {}
+    if target_env and target_env not in envs:
+        raise ValueError(
+            f"Environment {target_env!r} is not defined in {PROFILES_PATH}. "
+            f"Known: {sorted(envs.keys())}"
+        )
+    if target_env:
+        block = envs[target_env]
+        # graphql_url + mongo_uri are required to switch at all (we'd error
+        # out the moment any tool tried to read). jwt_secret is only needed
+        # for remint_admin_token / commit_import, so a placeholder there
+        # blocks token operations only — Mongo reads still work.
+        for k in ("graphql_url", "mongo_uri"):
+            v = block.get(k, "")
+            if not v or v.startswith("FILL_IN_"):
+                raise ValueError(
+                    f"profiles.json environment {target_env!r} field {k!r} "
+                    "is not configured."
+                )
+        jwt_placeholder = (block.get("jwt_secret") or "").startswith("FILL_IN_")
+        SYMLIV_ENV_NAME = target_env
+        SYMLIV_GRAPHQL_URL = block["graphql_url"]
+        SYMLIV_JWT_SECRET_KEY = "" if jwt_placeholder else block.get("jwt_secret", "")
+        SYMLIV_MONGO_URI = block["mongo_uri"]
+        # Pull a cached admin_token if one was set for this env. (Will be
+        # replaced moments later if remint_token=True and we can mint.)
+        cached_token = block.get("admin_token", "")
+        if cached_token:
+            SYMLIV_ADMIN_TOKEN = cached_token
+            os.environ["SYMLIV_ADMIN_TOKEN"] = cached_token
+        SYMLIV_MONGO_DB = block.get("mongo_db", "main")
+        SYMLIV_WORKSPACE_ROOT = block.get("workspace_root", SYMLIV_WORKSPACE_ROOT)
+        # Reflect into os.environ so any subprocess or imported lib that
+        # reads env vars at call time sees the new values.
+        os.environ["SYMLIV_GRAPHQL_URL"] = SYMLIV_GRAPHQL_URL
+        os.environ["SYMLIV_JWT_SECRET_KEY"] = SYMLIV_JWT_SECRET_KEY
+        os.environ["SYMLIV_MONGO_URI"] = SYMLIV_MONGO_URI
+        os.environ["SYMLIV_MONGO_DB"] = SYMLIV_MONGO_DB
+        os.environ["SYMLIV_WORKSPACE_ROOT"] = SYMLIV_WORKSPACE_ROOT
+        # Swap the Mongo client — the old one's connection pool gets GC'd.
+        _mongo, _db = _connect_mongo(SYMLIV_MONGO_URI, SYMLIV_MONGO_DB)
+        logger.info("switch_context: env → %s, mongo → %s",
+                    SYMLIV_ENV_NAME, SYMLIV_MONGO_URI.split("@")[-1].split("/")[0])
+
+    SYMLIV_COMMUNITY_ID = community_id
+    os.environ["SYMLIV_COMMUNITY_ID"] = community_id
+
+    # Persist the new selection so a Claude Code restart picks it up.
+    _PROFILES.setdefault("current", {})
+    _PROFILES["current"]["environment"] = SYMLIV_ENV_NAME
+    _PROFILES["current"]["community_id"] = community_id
+    _save_profiles(_PROFILES)
+    _ENV_BLOCK = _active_env_block(_PROFILES)
+
+    minted = None
+    if remint_token and not SYMLIV_JWT_SECRET_KEY:
+        # Can't mint without the secret — skip and tell the caller why.
+        minted = {"skipped": "jwt_secret not configured for this environment"}
+    elif remint_token:
+        # Delegate to the existing remint logic — it reads from the globals
+        # we just rebound, so it produces a token for the new community.
+        try:
+            minted = remint_admin_token(expires_in_hours=12, update_in_process=True)
+        except Exception as e:
+            logger.warning("switch_context: token remint failed: %s", e)
+            minted = {"error": str(e)}
+
+    return {
+        "ok": True,
+        "environment": SYMLIV_ENV_NAME,
+        "community_id": SYMLIV_COMMUNITY_ID,
+        "graphql_url": SYMLIV_GRAPHQL_URL,
+        "mongo_db": SYMLIV_MONGO_DB,
+        "workspace_root": SYMLIV_WORKSPACE_ROOT,
+        "token_remint": (
+            "ok" if minted and "token" in minted else
+            ("skipped" if not remint_token else minted)
+        ),
+        "persisted_to": str(PROFILES_PATH),
+    }
+
+
+@mcp.tool()
+def set_admin_token(
+    token: Annotated[
+        str,
+        Field(description="A signed JWT (no 'Bearer ' prefix) with the "
+                          "symlivAdmin role. Easiest source: paste from "
+                          "DevTools → Network → graphql request → "
+                          "Authorization header on a logged-in browser session."),
+    ],
+    persist: Annotated[
+        bool,
+        Field(
+            description="If True (default), save the token to the current "
+                        "environment's block in profiles.json so it survives "
+                        "MCP-server restarts (file is gitignored). False = "
+                        "in-process only."
+        ),
+    ] = True,
+) -> dict[str, Any]:
+    """Replace the in-process SYMLIV_ADMIN_TOKEN with a token you obtained
+    out-of-band (typically a browser-issued JWT). Useful when you don't have
+    the JWT_SECRET_KEY for the target environment and so can't call
+    remint_admin_token. Decodes (without signature verification) to show
+    you what's inside for sanity-checking."""
+    global SYMLIV_ADMIN_TOKEN, _PROFILES, _ENV_BLOCK
+    token = (token or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    if token.count(".") != 2:
+        raise ValueError("Doesn't look like a JWT (needs three dot-separated "
+                         "segments). Did you paste the full token?")
+
+    # Decode without verifying the signature so we can show the user what
+    # they just pasted. We don't have the prod secret to verify against
+    # anyway — that's the whole point of this tool.
+    try:
+        claims = jwt.decode(token, options={"verify_signature": False})
+    except Exception as e:
+        raise ValueError(f"Could not decode JWT payload: {e}")
+
+    import time
+    now = int(time.time())
+    exp = claims.get("exp")
+    roles = claims.get("roles") or []
+    summary = {
+        "user_id": claims.get("id"),
+        "roles": roles,
+        "community_id_in_jwt": claims.get("communityId"),
+        "expires_at": exp,
+        "expires_in_hours": round((exp - now) / 3600, 1) if exp else None,
+        "has_symlivAdmin": "symlivAdmin" in roles,
+    }
+    if exp and exp <= now:
+        raise ValueError(f"Token already expired at {exp} (now={now}).")
+    if "symlivAdmin" not in roles:
+        # Don't refuse — sometimes you want a non-admin token for testing —
+        # but flag it loudly. Imports won't work without symlivAdmin.
+        summary["warning"] = (
+            "Token does NOT have symlivAdmin role. Imports and most admin "
+            "queries will fail. Verify you grabbed the right user's token."
+        )
+
+    SYMLIV_ADMIN_TOKEN = token
+    os.environ["SYMLIV_ADMIN_TOKEN"] = token
+
+    if persist:
+        # Write the token into profiles.json under the active environment.
+        # profiles.json is gitignored — see project .gitignore.
+        env_name = SYMLIV_ENV_NAME or "default"
+        _PROFILES.setdefault("environments", {}).setdefault(env_name, {})
+        _PROFILES["environments"][env_name]["admin_token"] = token
+        _save_profiles(_PROFILES)
+        _ENV_BLOCK = _active_env_block(_PROFILES)
+
+    return {
+        "ok": True,
+        "in_process_updated": True,
+        "persisted_to_env": SYMLIV_ENV_NAME if persist else None,
+        "token_summary": summary,
+        "note": (
+            "Token applied. The next GraphQL call will use it. "
+            "community-id header still comes from SYMLIV_COMMUNITY_ID, so "
+            "you can target any community from a single token as long as "
+            "the role is symlivAdmin."
         ),
     }
 

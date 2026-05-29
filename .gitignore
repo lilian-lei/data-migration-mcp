@@ -9,3 +9,6 @@ wheels/
 # Virtual environments
 .venv
 symliv-mcp.log
+
+# Holds environment URLs, JWT secrets, and cached admin tokens — never commit.
+src/profiles.json
